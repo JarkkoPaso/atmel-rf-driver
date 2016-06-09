@@ -18,6 +18,15 @@
 #include "atmel-rf-driver/driverRFPhy.h"
 #include "driverAtmelRFInterface.h"
 #include "mbed-drivers/mbed.h"
+#ifdef MBED_CONF_RTOS_PRESENT
+#include "Mutex.h"
+#include "Semaphore.h"
+#include "Thread.h"
+using namespace rtos;
+
+static void rf_if_irq_task();
+static void rf_if_irq_task_process_irq();
+#endif
 
 // Pending better config support, we gate compilation
 // on this being defined. Which will be for Arduino
@@ -37,6 +46,11 @@ struct RFBits {
     Timeout ack_timer;
     Timeout cal_timer;
     Timeout cca_timer;
+#ifdef MBED_CONF_RTOS_PRESENT
+    Semaphore irq_sem;
+    Thread irq_thread;
+    Mutex mutex;
+#endif
 };
 
 RFBits::RFBits() :
@@ -46,7 +60,12 @@ spi(YOTTA_CFG_ATMEL_RF_SPI_MOSI,
 CS(YOTTA_CFG_ATMEL_RF_SPI_CS),
 RST(YOTTA_CFG_ATMEL_RF_SPI_RST),
 SLP_TR(YOTTA_CFG_ATMEL_RF_SPI_SLP),
-IRQ(YOTTA_CFG_ATMEL_RF_SPI_IRQ) { }
+IRQ(YOTTA_CFG_ATMEL_RF_SPI_IRQ)
+#ifdef MBED_CONF_RTOS_PRESENT
+,irq_sem(0),
+irq_thread(rf_if_irq_task, osPriorityRealtime, 1024)
+#endif
+{ }
 
 void (*app_rf_settings_cb)(void) = 0;
 static RFBits *rf;
@@ -61,12 +80,20 @@ static uint8_t rf_if_spi_exchange(uint8_t out);
 
 void rf_if_lock(void)
 {
+#ifdef MBED_CONF_RTOS_PRESENT
+    rf->mutex.lock();
+#else
     platform_enter_critical();
+#endif
 }
 
 void rf_if_unlock(void)
 {
+#ifdef MBED_CONF_RTOS_PRESENT
+    rf->mutex.unlock();
+#else
     platform_exit_critical();
+#endif
 }
 
 /* Delay functions for RF Chip SPI access */
@@ -887,6 +914,25 @@ void rf_if_set_channel_register(uint8_t channel)
   rf_if_set_bit(PHY_CC_CCA, channel, 0x1f);
 }
 
+#ifdef MBED_CONF_RTOS_PRESENT
+void rf_if_interrupt_handler(void)
+{
+    rf->irq_sem.release();
+    //rf->IRQ->disable_irq();
+}
+
+static void rf_if_irq_task(void)
+{
+    for (;;) {
+        rf->irq_sem.wait();
+        rf_if_lock();
+        rf_if_irq_task_process_irq();
+        rf_if_unlock();
+    }
+}
+
+static void rf_if_irq_task_process_irq(void)
+#else
 /*
  * \brief Function is a RF interrupt vector. End of frame in RX and TX are handled here as well as CCA process interrupt.
  *
@@ -895,6 +941,7 @@ void rf_if_set_channel_register(uint8_t channel)
  * \return none
  */
 void rf_if_interrupt_handler(void)
+#endif
 {
   uint8_t irq_status;
 
@@ -932,6 +979,9 @@ void rf_if_interrupt_handler(void)
   {
     rf_handle_cca_ed_done();
   }
+//#ifdef MBED_CONF_RTOS_PRESENT
+//  rf->IRQ->enable_irq();
+//#endif
 }
 
 /*
